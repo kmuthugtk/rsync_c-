@@ -14,6 +14,9 @@
 #include <stdf_reader/stdf_v4_api.h>
 #include <stdf_reader/stdf_v4_file.h>
 #include "logger.h"
+#include "extractor.h"
+#include "nlohmann/json.hpp"
+using json = nlohmann::json;
 
 // RabbitMQ Server COnfiguration
 const std::string RABBITMQ_HOST = "10.100.246.53";
@@ -25,6 +28,7 @@ const std::string QUEUE_NAME = "LPX-67";
 const std::string EXCHANGE_NAME = "";
 const std::string ROUTING_KEY = "LPX-67";
 const int CHANNEL_ID = 1;
+int PREVIOUS_POSITION = 0;
 
 std::string getCurrentTimestamp() {
     struct timeval tv;
@@ -140,7 +144,12 @@ void consumeMessages() {
         amqp_envelope_t envelope;
 
         amqp_maybe_release_buffers(conn);
-        res = amqp_consume_message(conn, &envelope, nullptr, 0);
+
+        // Use a short timeout (1 second) to allow for graceful shutdown if needed
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        res = amqp_consume_message(conn, &envelope, &timeout, 0);
 
         if (res.reply_type == AMQP_RESPONSE_NORMAL)
         {
@@ -148,9 +157,138 @@ void consumeMessages() {
             //std::cout << getCurrentTimestamp() << " Received message: " << message_body << std::endl;
             LOG.info("Received message: " + message_body, "RabbitMQ");
 
+            bool processSuccess = false;
+            json messageJson = json::parse(message_body);
+            std::string stdfFilePath;
+            int startPos = 0;
+            int endPos = 0;
+            time_t sync_time = time(nullptr);
+
+
+            /*stdfFilePath = "/tmp/IFLEX-18/" + messageJson["temp_file_name"].get<std::string>();
+            startPos = messageJson["previous_position"].get<int>();
+            endPos = messageJson["read_position"].get<int>();
+            sync_time = messageJson["sync_time"].get<time_t>();
+
+            std::string jsonOutputFileName = "/tmp/IFLEX-18/Output/Output.json";
+            */
+
+            // Check and extract temp_file_name
+            if (messageJson.contains("temp_file_name") && !messageJson["temp_file_name"].is_null()) {
+                stdfFilePath = "/tmp/IFLEX-18/" + messageJson["temp_file_name"].get<std::string>();
+            } else {
+                LOG.error("Missing or null 'temp_file_name' in message", "RabbitMQ");
+                amqp_basic_ack(conn, CHANNEL_ID, envelope.delivery_tag, false);
+                amqp_destroy_envelope(&envelope);
+                continue; // Skip this message and process the next one
+            }
+
+            // Check and extract previous_position
+            if (messageJson.contains("previous_position") && !messageJson["previous_position"].is_null()) {
+                // Handle different types (could be string or number)
+                if (messageJson["previous_position"].is_string()) {
+                    std::string posStr = messageJson["previous_position"].get<std::string>();
+                    // Remove commas if present
+                    posStr.erase(std::remove(posStr.begin(), posStr.end(), ','), posStr.end());
+                    startPos = std::stoi(posStr);
+                } else {
+                    startPos = messageJson["previous_position"].get<int>();
+                }
+            } else {
+                LOG.warning("Missing or null 'previous_position' in message, using 0", "RabbitMQ");
+            }
+
+            // Check and extract read_position
+            if (messageJson.contains("read_position") && !messageJson["read_position"].is_null()) {
+                // Handle different types (could be string or number)
+                if (messageJson["read_position"].is_string()) {
+                    std::string posStr = messageJson["read_position"].get<std::string>();
+                    // Remove commas if present
+                    posStr.erase(std::remove(posStr.begin(), posStr.end(), ','), posStr.end());
+                    endPos = std::stoi(posStr);
+                } else {
+                    endPos = messageJson["read_position"].get<int>();
+                }
+            } else {
+                LOG.error("Missing or null 'read_position' in message", "RabbitMQ");
+                amqp_basic_ack(conn, CHANNEL_ID, envelope.delivery_tag, false);
+                amqp_destroy_envelope(&envelope);
+                continue; // Skip this message and process the next one
+            }
+
+            // Check and extract sync_time
+            if (messageJson.contains("sync_time") && !messageJson["sync_time"].is_null()) {
+                if (messageJson["sync_time"].is_string()) {
+                    std::string timeStr = messageJson["sync_time"].get<std::string>();
+                    
+                    // Parse the datetime string to a time_t
+                    // Assuming format like "2025/02/28 16:35:20.123"
+                    struct tm tm = {};
+                    char* result = strptime(timeStr.c_str(), "%Y/%m/%d %H:%M:%S", &tm);
+                    
+                    if (result) {
+                        // Successfully parsed datetime string
+                        sync_time = mktime(&tm);
+                        LOG.debug("Parsed sync_time: " + timeStr + " to " + std::to_string(sync_time), "RabbitMQ");
+                    } else {
+                        LOG.warning("Failed to parse sync_time string: " + timeStr + ", using current time", "RabbitMQ");
+                        sync_time = time(nullptr);
+                    }
+                } else if (messageJson["sync_time"].is_number()) {
+                    sync_time = messageJson["sync_time"].get<time_t>();
+                }
+            } else {
+                LOG.warning("Missing or null 'sync_time' in message, using current time", "RabbitMQ");
+            }
+
+            LOG.info("Processing file: " + stdfFilePath + ", positions: " + 
+                    std::to_string(startPos) + " to " + std::to_string(endPos), "StdfExtractor");
+
+            std::string jsonOutputFileName = "/tmp/IFLEX-18/Output/Output.json";
+
+            // Extract the PRR Records from the specified
+            std::vector<StdfPRR*> prrRecords = StdfExtractor::extractPrrRecords(stdfFilePath.c_str(), startPos, endPos);
+
+            LOG.info("Extracted " + std::to_string(prrRecords.size()) + " PRR records from " + stdfFilePath, "StdfExtractor");
+
+            // Save to JSON file
+            /*bool saveSuccess = StdfExtractor::savePrrRecords(prrRecords, jsonOutputFileName, sync_time);
+            if(saveSuccess) {
+                LOG.info("Saved " + std::to_string(prrRecords.size()) + " the PRR records to JSON file: " + jsonOutputFileName, "StdfExtractor");
+            } else {
+                LOG.error("Failed to save PRR records to JSON file: " + jsonOutputFileName, "StdfExtractor");
+            }*/
+            bool saveSuccess = false;
+            try {
+                saveSuccess = StdfExtractor::savePrrRecords(prrRecords, jsonOutputFileName, sync_time);
+                if(saveSuccess) {
+                    LOG.info("Saved " + std::to_string(prrRecords.size()) + " PRR records to JSON file: " + jsonOutputFileName, "StdfExtractor");
+                    processSuccess = true; // Mark overall process as successful
+                } else {
+                    LOG.error("Failed to save PRR records to JSON file: " + jsonOutputFileName, "StdfExtractor");
+                }
+            } catch (const std::exception& e) {
+                LOG.error("Exception while saving PRR records: " + std::string(e.what()), "StdfExtractor");
+            }
+
+            // Clean up extracted records
+            StdfExtractor::freePrrRecords(prrRecords);
+
             // Ack the message
-            amqp_basic_ack(conn, CHANNEL_ID, envelope.delivery_tag, false);
-            LOG.debug("Message acknowledged", "RabbitMQ");
+            //amqp_basic_ack(conn, CHANNEL_ID, envelope.delivery_tag, false);
+            //LOG.debug("Message acknowledged", "RabbitMQ");
+
+            // Handle message acknowledgment based on processing success
+            if (processSuccess) {
+                // Acknowledge the message only if processing was successful
+                amqp_basic_ack(conn, CHANNEL_ID, envelope.delivery_tag, false);
+                LOG.info("Message successfully processed and acknowledged", "RabbitMQ");
+            } else {
+                // Negative acknowledgment (reject) the message if processing failed
+                // requeue=false to prevent the message from being redelivered
+                amqp_basic_reject(conn, CHANNEL_ID, envelope.delivery_tag, false);
+                LOG.warning("Message processing failed - rejected message", "RabbitMQ");
+            }
 
             amqp_destroy_envelope(&envelope);
         } else{
@@ -254,13 +392,36 @@ bool publishMessage(const std::string& message) {
     return true;
 }
 
-std::string createJsonMessage(const std::string& file_name, const std::string& sync_time, const std::string& read_position) {
+/*
+std::string createJsonMessage(const std::string& file_name, const std::string& sync_time, const std::string& read_position, const std::string& previous_position) {
     std::stringstream ss;
     ss << "{\"temp_file_name\":\"" << file_name
        << "\", \"sync_time\":\"" << sync_time 
-       << "\", \"read_position\":\"" << read_position << "\"}";
+       << "\", \"read_position\":\"" << read_position 
+       << "\", \"previous_position\":\"" << previous_position << "\"}";
     return ss.str();
+}*/
+
+std::string createJsonMessage(const std::string& file_name, const std::string& sync_time, 
+    const std::string& read_position, const std::string& previous_position) {
+    // Use nlohmann::json to build the message properly
+    json message;
+    message["temp_file_name"] = file_name;
+    message["sync_time"] = sync_time;  // Convert to numeric timestamp
+
+    // Clean and convert read_position to number
+    std::string clean_read_pos = read_position;
+    clean_read_pos.erase(std::remove(clean_read_pos.begin(), clean_read_pos.end(), ','), clean_read_pos.end());
+    message["read_position"] = std::stoi(clean_read_pos);
+
+    // Clean and convert previous_position to number
+    std::string clean_prev_pos = previous_position;
+    clean_prev_pos.erase(std::remove(clean_prev_pos.begin(), clean_prev_pos.end(), ','), clean_prev_pos.end());
+    message["previous_position"] = std::stoi(clean_prev_pos);
+
+    return message.dump();
 }
+
 
 void executeRsync(const std::string& source, const std::string&  destination, const std::string& logfile) {
     // Get the current time with milliseconds for logging
@@ -330,10 +491,21 @@ void executeRsync(const std::string& source, const std::string&  destination, co
 
             //std::cout << getCurrentTimestamp() << "Read position: " << transferred_bytes << std::endl;
             LOG.info("Read position: " + transferred_bytes + " at " + transfer_speed, "Rsync");
-            std::string message = createJsonMessage(file_name, executeTime, transferred_bytes);
+            std::string message = createJsonMessage(file_name, executeTime, transferred_bytes, std::to_string(PREVIOUS_POSITION));
             //std::cout << getCurrentTimestamp() << "Generated JSON Message: " << message << std::endl;
             LOG.info("Generated JSON Message: " + message, "Rsync");
             publishMessage(message);
+            //PREVIOUS_POSITION = transferred_bytes;
+            std::string clean_bytes = transferred_bytes;
+            clean_bytes.erase(std::remove(clean_bytes.begin(), clean_bytes.end(), ','), clean_bytes.end());
+
+            try {
+                PREVIOUS_POSITION = std::stoi(clean_bytes);
+                LOG.debug("Updated PREVIOUS_POSITION to: " + std::to_string(PREVIOUS_POSITION), "Rsync");
+            } catch (const std::exception& e) {
+                LOG.error("Failed to convert position value to integer: " + transferred_bytes, "Rsync");
+                // Keep previous value unchanged
+            }
         }
     }
 
@@ -360,12 +532,12 @@ void executeRsync(const std::string& source, const std::string&  destination, co
 
 // Function to read part of an STDF file and extract PRR records
 int main() {
-    const std::string source = "rsync://LPX-67/user/UTAC_UTACS1-S_WP90-73509-11A_WS8P-73509-11A-01P0_7R4C395.000-7R4C395.22E7_20250227134121_0_WS1.stdf_open";
+    const std::string source = "rsync://IFLEX-38/user/IFLEX-38_1_v14082p01j_ad7149-6_2pc_AT5_6871847.1_C40239-08E1_mar01_23_05.stdf";
     const std::string destination = "/tmp/IFLEX-18/";
     const std::string logfile = "/tmp/IFLEX-18/Logs/rsync_log_IFLEX-LPX-67.txt";
 
     // Initialize Logger
-    std::string appLogPath = "/tmp/IFLEX-18/Logs/application_IFLEX-67.log";
+    std::string appLogPath = "/tmp/IFLEX-18/Logs/application_IFLEX-38.log";
     LOG.init(appLogPath, LogLevel::DEBUG);
     LOG.info("Application starting....", "Main");
 
@@ -403,6 +575,6 @@ int main() {
     rsync_thread.join();
 
     LOG.info("Application shutting down", "Main");
-    
+
     return 0;
 }
