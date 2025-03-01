@@ -532,7 +532,7 @@ void executeRsync(const std::string& source, const std::string&  destination, co
 
 // Function to read part of an STDF file and extract PRR records
 int main() {
-    const std::string source = "rsync://IFLEX-38/user/IFLEX-38_1_v14082p01j_ad7149-6_2pc_AT5_6871847.1_C40239-08E1_mar01_23_05.stdf";
+    const std::string source = "rsync://IFLEX-38/user/IFLEX-38_1_v14082p01j_ad7149-6_2pc_AT5_6871847.1_C40239-09D4_mar02_00_09.stdf";
     const std::string destination = "/tmp/IFLEX-18/";
     const std::string logfile = "/tmp/IFLEX-18/Logs/rsync_log_IFLEX-LPX-67.txt";
 
